@@ -5,9 +5,13 @@
  */
 package io.debezium.server.kinesis;
 
+import java.io.FileWriter;
+import java.io.IOException;
 import java.net.URI;
+import java.util.EmptyStackException;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
@@ -53,6 +57,23 @@ public class KinesisChangeConsumer extends BaseChangeConsumer implements Debeziu
 
     private String region;
     private Optional<String> endpointOverride;
+    private static FileWriter failfile;
+    // private static File failfile;
+
+    @ConfigProperty(name = PROP_PREFIX + "retry.enable", defaultValue = "false")
+    String retryEnable;
+
+    @ConfigProperty(name = PROP_PREFIX + "retry.count", defaultValue = "1")
+    String retryCount;
+
+    @ConfigProperty(name = PROP_PREFIX + "retry.delay.ms", defaultValue = "1000")
+    String retryDelay;
+
+    @ConfigProperty(name = PROP_PREFIX + "retry.fail.file.enable", defaultValue = "true")
+    String retryfileEnable;
+
+    @ConfigProperty(name = PROP_PREFIX + "retry.fail.file.location", defaultValue = "kinesis_")
+    String retryfileLocation;
 
     @ConfigProperty(name = PROP_PREFIX + "credentials.profile", defaultValue = "default")
     String credentialsProfile;
@@ -105,7 +126,49 @@ public class KinesisChangeConsumer extends BaseChangeConsumer implements Debeziu
                     .streamName(streamNameMapper.map(record.destination()))
                     .data(SdkBytes.fromByteArray(getBytes(record.value())))
                     .build();
-            client.putRecord(putRecord);
+            if (retryEnable.equals("false")) {
+                client.putRecord(putRecord);
+            }
+            else {
+                int rCount = Integer.parseInt(retryCount);
+                int intDelay = Integer.parseInt(retryDelay);
+                int putRes = 0;
+                for (int i = 1; i <= rCount; i++) {
+                    try {
+                        client.putRecord(putRecord);
+                        putRes++;
+                        break;
+                    }
+                    catch (Exception e) {
+                        LOGGER.warn("Exception while putting record to Kinesis: retry count:" + i);
+                        LOGGER.warn("Exception:", e);
+                        if (i < rCount) {
+                            Thread.sleep(intDelay);
+                        }
+                    }
+                }
+                if (retryfileEnable.equals("true") && putRes == 0) {
+                    try {
+                        failfile = new FileWriter(retryfileLocation + UUID.randomUUID().toString() + ".json");
+                        failfile.write(record.value().toString());
+                    }
+                    catch (Exception e) {
+                        LOGGER.error("Exception while writing failed record to local file:", e);
+                        throw new EmptyStackException();
+                    }
+                    finally {
+                        try {
+                            failfile.flush();
+                            failfile.close();
+                        }
+                        catch (IOException ioe) {
+                            LOGGER.error("Exception while closing local file:", ioe);
+                            throw new EmptyStackException();
+                        }
+                    }
+
+                }
+            }
             committer.markProcessed(record);
         }
         committer.markBatchFinished();
